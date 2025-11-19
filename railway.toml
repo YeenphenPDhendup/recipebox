@@ -1,0 +1,13 @@
+[build]
+builder = "nixpacks"
+buildCommand = "cd backend && npm install"
+
+[deploy]
+startCommand = "cd backend && npm start"
+
+[[services]]
+name = "web"
+[[services.ports]]
+port = 3000
+[[services.ports]]
+http = "/"
