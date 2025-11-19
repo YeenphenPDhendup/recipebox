@@ -1,6 +1,4 @@
 const winston = require('winston');
-const DailyRotateFile = require('winston-daily-rotate-file');
-const path = require('path');
 
 // Define log format
 const logFormat = winston.format.combine(
@@ -25,56 +23,21 @@ const logFormat = winston.format.combine(
     })
 );
 
-// Transport for error logs
-const errorTransport = new DailyRotateFile({
-    filename: path.join(__dirname, '../logs/error-%DATE%.log'),
-    datePattern: 'YYYY-MM-DD',
-    level: 'error',
-    maxFiles: '30d',
-    maxSize: '20m',
-    format: logFormat
-});
-
-// Transport for combined logs
-const combinedTransport = new DailyRotateFile({
-    filename: path.join(__dirname, '../logs/combined-%DATE%.log'),
-    datePattern: 'YYYY-MM-DD',
-    maxFiles: '30d',
-    maxSize: '20m',
-    format: logFormat
-});
-
-// Transport for security logs
-const securityTransport = new DailyRotateFile({
-    filename: path.join(__dirname, '../logs/security-%DATE%.log'),
-    datePattern: 'YYYY-MM-DD',
-    level: 'warn',
-    maxFiles: '90d',
-    maxSize: '20m',
-    format: logFormat
-});
-
-// Create logger instance
+// Create logger instance - CONSOLE ONLY for Vercel
 const logger = winston.createLogger({
     level: process.env.NODE_ENV === 'production' ? 'info' : 'debug',
     format: logFormat,
     transports: [
-        errorTransport,
-        combinedTransport,
-        securityTransport
+        // Console transport for all environments
+        new winston.transports.Console({
+            format: winston.format.combine(
+                winston.format.colorize(),
+                winston.format.simple()
+            )
+        })
     ],
     exitOnError: false
 });
-
-// Console transport for development
-if (process.env.NODE_ENV !== 'production') {
-    logger.add(new winston.transports.Console({
-        format: winston.format.combine(
-            winston.format.colorize(),
-            winston.format.simple()
-        )
-    }));
-}
 
 // Security logging helper
 logger.security = (action, details) => {
