@@ -10,10 +10,6 @@ const cookieParser = require('cookie-parser');
 const session = require('express-session');
 const MongoStore = require('connect-mongo');
 const rateLimit = require('express-rate-limit');
-const https = require('https');
-const http = require('http');
-const fs = require('fs');
-const logger = require('./config/logger');
 const path = require('path');
 
 const app = express();
@@ -23,16 +19,33 @@ app.use(helmet({
     contentSecurityPolicy: {
         directives: {
             defaultSrc: ["'self'"],
-            styleSrc: ["'self'", "'unsafe-inline'"],
+            styleSrc: ["'self'", "'unsafe-inline'", 'https://cdnjs.cloudflare.com'],
             scriptSrc: ["'self'", "'unsafe-inline'"],
             imgSrc: ["'self'", "data:", "https:"],
+            fontSrc: ["'self'", "https://cdnjs.cloudflare.com"]
         }
-    }
+    },
+    crossOriginEmbedderPolicy: false
 }));
 
-// CORS - HTTPS first
+// CORS - Updated for Render
 app.use(cors({
-    origin: ['https://localhost:3000', 'http://localhost:3000'], // HTTPS FIRST
+    origin: function(origin, callback) {
+        // Allow requests with no origin (like mobile apps or curl requests)
+        if (!origin) return callback(null, true);
+        
+        const allowedOrigins = [
+            'https://recipe-box.onrender.com',
+            'http://localhost:3000',
+            'https://localhost:3000'
+        ];
+        
+        if (allowedOrigins.indexOf(origin) !== -1) {
+            callback(null, true);
+        } else {
+            callback(new Error('Not allowed by CORS'));
+        }
+    },
     credentials: true
 }));
 
@@ -48,7 +61,6 @@ const generalLimiter = rateLimit({
     legacyHeaders: false,
 });
 
-// Specific login rate limiter - COUNT ALL ATTEMPTS (failed and successful)
 const loginLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 5,
@@ -56,7 +68,7 @@ const loginLimiter = rateLimit({
         success: false,
         error: 'Too many login attempts from this IP, please try again after 15 minutes'
     },
-    skipSuccessfulRequests: false, // ← COUNT FAILED ATTEMPTS TOO
+    skipSuccessfulRequests: false,
     standardHeaders: true,
     legacyHeaders: false,
 });
@@ -90,7 +102,7 @@ const adminLimiter = rateLimit({
 });
 
 app.use('/api/', generalLimiter);
-app.use('/api/auth/login', loginLimiter); // ← SPECIFIC LOGIN LIMITER
+app.use('/api/auth/login', loginLimiter);
 app.use('/api/auth/', authLimiter);
 app.use('/api/recipes/create', recipeCreationLimiter);
 app.use('/api/admin/', adminLimiter);
@@ -102,66 +114,91 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 // Cookie parser
 app.use(cookieParser());
 
-// Data sanitization against NoSQL injection
+// Data sanitization
 app.use(mongoSanitize());
-
-// Data sanitization against XSS
 app.use(xss());
-
-// Prevent parameter pollution
 app.use(hpp());
 
-// Session configuration - CRITICAL FIX: Set secure to true for HTTPS
+// Session configuration - Optimized for Render
 app.use(session({
-    secret: process.env.SESSION_SECRET || 'your-secret-key',
+    secret: process.env.SESSION_SECRET || 'fallback-secret-key-change-in-production',
     resave: false,
     saveUninitialized: false,
     store: MongoStore.create({
         mongoUrl: process.env.MONGODB_URI,
-        touchAfter: 24 * 3600
+        ttl: 7 * 24 * 60 * 60, // 7 days
+        autoRemove: 'native'
     }),
     cookie: {
-        secure: true, // ← CHANGED FROM false TO true (THIS FIXES "NOT SECURE")
+        secure: process.env.NODE_ENV === 'production',
         httpOnly: true,
-        maxAge: 7 * 24 * 60 * 60 * 1000,
-        sameSite: 'strict'
+        maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+        sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax'
     }
 }));
 
-// Serve static files
+// Serve static files from public directory
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Request logging
+// Simple request logging
 app.use((req, res, next) => {
-    logger.logRequest(req);
+    console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
     next();
 });
 
-// Routes
+// Import routes
 const authRoutes = require('./routes/authRoutes');
 const adminRoutes = require('./routes/adminRoutes');
 const recipeRoutes = require('./routes/recipeRoutes');
 
+// Use routes
 app.use('/api/auth', authRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/recipes', recipeRoutes);
 
-// Health check
+// Health check endpoint
 app.get('/health', (req, res) => {
-    res.status(200).json({ status: 'OK', timestamp: new Date() });
+    res.status(200).json({ 
+        status: 'OK', 
+        timestamp: new Date().toISOString(),
+        environment: process.env.NODE_ENV || 'development',
+        mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected'
+    });
 });
 
-// 404 Handler
-app.use((req, res) => {
+// Root endpoint
+app.get('/', (req, res) => {
+    res.json({ 
+        message: 'Recipe Box API',
+        version: '1.0.0',
+        environment: process.env.NODE_ENV || 'development',
+        endpoints: {
+            recipes: '/api/recipes',
+            auth: '/api/auth',
+            admin: '/api/admin',
+            health: '/health'
+        },
+        documentation: 'Check /health for system status'
+    });
+});
+
+// Serve frontend for all other routes (SPA support)
+app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// 404 Handler for API routes
+app.use('/api/*', (req, res) => {
     res.status(404).json({
         success: false,
-        message: 'Route not found'
+        message: 'API endpoint not found'
     });
 });
 
 // Global error handler
 app.use((err, req, res, next) => {
-    logger.logError(err, req);
+    console.error('Error:', err.message);
+    console.error('Stack:', err.stack);
     
     const statusCode = err.statusCode || 500;
     const message = process.env.NODE_ENV === 'production' 
@@ -175,81 +212,92 @@ app.use((err, req, res, next) => {
     });
 });
 
-// MongoDB Connection
-mongoose.connect(process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/recipebox')
-    .then(() => {
-        logger.info('MongoDB connected successfully');
-        console.log('MongoDB connected');
-    })
-    .catch((error) => {
-        logger.error('MongoDB connection error', { error: error.message });
-        console.error('MongoDB connection failed:', error.message);
-        process.exit(1);
-    });
+// MongoDB Connection with enhanced error handling
+const connectDB = async () => {
+    try {
+        if (!process.env.MONGODB_URI) {
+            throw new Error('MONGODB_URI environment variable is not set');
+        }
 
-// HTTPS/HTTP Server Setup
+        console.log('🔄 Connecting to MongoDB...');
+        
+        const conn = await mongoose.connect(process.env.MONGODB_URI, {
+            useNewUrlParser: true,
+            useUnifiedTopology: true,
+            serverSelectionTimeoutMS: 10000,
+            socketTimeoutMS: 45000,
+            maxPoolSize: 10,
+        });
+
+        console.log('✅ MongoDB connected successfully');
+        console.log(`📊 Host: ${conn.connection.host}`);
+        console.log(`🗃️ Database: ${conn.connection.name}`);
+        
+    } catch (error) {
+        console.error('❌ MongoDB connection failed:', error.message);
+        console.log('💡 Troubleshooting tips:');
+        console.log('   1. Check MONGODB_URI environment variable');
+        console.log('   2. Verify MongoDB Atlas IP whitelist (0.0.0.0/0)');
+        console.log('   3. Check database user permissions');
+        console.log('   4. Ensure cluster is running in Atlas');
+        console.log('🔄 Retrying connection in 10 seconds...');
+        setTimeout(connectDB, 10000);
+    }
+};
+
+// MongoDB event handlers
+mongoose.connection.on('disconnected', () => {
+    console.log('⚠️ MongoDB disconnected');
+});
+
+mongoose.connection.on('error', (err) => {
+    console.error('❌ MongoDB connection error:', err);
+});
+
+// Initialize database connection
+connectDB();
+
+// Server startup
 const PORT = process.env.PORT || 3000;
-let server;
 
-// Check if SSL certificates exist in ssl folder
-const keyPath = './ssl/key.pem';
-const certPath = './ssl/cert.pem';
-
-if (fs.existsSync(keyPath) && fs.existsSync(certPath)) {
-    const options = {
-        key: fs.readFileSync(keyPath),
-        cert: fs.readFileSync(certPath)
-    };
-    server = https.createServer(options, app).listen(PORT, () => {
-        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-        console.log(`Recipe Box Server Running (HTTPS - TRUSTED)`);
-        console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
-        console.log(`Port: ${PORT}`);
-        console.log(`Secure: https://localhost:${PORT}`);
-        console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
-        console.log(`Rate Limiting: ENABLED`);
-        console.log(`SSL: ENABLED (mkcert trusted)`);
-        console.log(`Secure Cookies: ENABLED`);
-        console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
-        console.log(`Admin: https://localhost:${PORT}/admin-login.html`);
-        console.log(`Users: https://localhost:${PORT}/login.html`);
-        console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
-        logger.info('HTTPS Server started successfully', { port: PORT });
-    });
-    console.log('HTTPS enabled with mkcert trusted certificates');
-} else {
-    server = http.createServer(app).listen(PORT, () => {
-        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-        console.log(`Recipe Box Server Running (HTTP)`);
-        console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
-        console.log(`Port: ${PORT}`);
-        console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
-        console.log(`Rate Limiting: ENABLED`);
-        console.log(`SSL:DISABLED (certificates not found)`);
-        console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
-        console.log(`🔐 Admin: http://localhost:${PORT}/admin-login.html`);
-        console.log(`👥 Users: http://localhost:${PORT}/login.html`);
-        console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
-        logger.info('HTTP Server started successfully', { port: PORT });
-    });
-    console.log('⚠️  Running in HTTP mode - SSL certificates not found in ssl folder');
-}
+const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    console.log('🚀 Recipe Box Server Running on Render');
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    console.log(`📍 Port: ${PORT}`);
+    console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`🔗 URL: https://recipe-box.onrender.com`);
+    console.log(`📊 MongoDB: ${mongoose.connection.readyState === 1 ? 'Connected' : 'Connecting...'}`);
+    console.log(`🔒 CORS: Enabled for production`);
+    console.log(`📝 Rate Limiting: Enabled`);
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    console.log(`📋 Available Endpoints:`);
+    console.log(`   • GET  /health - System status`);
+    console.log(`   • GET  / - API information`);
+    console.log(`   • POST /api/auth/login - User login`);
+    console.log(`   • GET  /api/recipes - Get recipes`);
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+});
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
-    logger.info('SIGTERM signal received: closing HTTP server');
+    console.log('🛑 SIGTERM received: shutting down gracefully');
     server.close(() => {
-        logger.info('HTTP server closed');
+        console.log('✅ HTTP server closed');
         mongoose.connection.close(false, () => {
-            logger.info('MongoDB connection closed');
+            console.log('✅ MongoDB connection closed');
             process.exit(0);
         });
     });
 });
 
 process.on('unhandledRejection', (err) => {
-    logger.error('Unhandled Rejection', { error: err });
-    console.error('Unhandled Rejection:', err);
+    console.error('❌ Unhandled Rejection:', err);
+    server.close(() => process.exit(1));
+});
+
+process.on('uncaughtException', (err) => {
+    console.error('❌ Uncaught Exception:', err);
     server.close(() => process.exit(1));
 });
 
