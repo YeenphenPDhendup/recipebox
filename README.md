@@ -2,7 +2,7 @@ Recipe Box 🍽️
 A full-stack recipe management application built with Node.js, Express, MongoDB, and deployed on Vercel.
 
 Live Demo
-Live Application: https://recipebox-jhyj.vercel.app
+Live Application: https://recipebox-six.vercel.app/login.html
 
 Features
 User Authentication - Secure login with OTP verification
