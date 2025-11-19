@@ -10,9 +10,6 @@ const cookieParser = require('cookie-parser');
 const session = require('express-session');
 const MongoStore = require('connect-mongo');
 const rateLimit = require('express-rate-limit');
-const https = require('https');
-const http = require('http');
-const fs = require('fs');
 const logger = require('./config/logger');
 const path = require('path');
 
@@ -23,23 +20,27 @@ app.use(helmet({
     contentSecurityPolicy: {
         directives: {
             defaultSrc: ["'self'"],
-            styleSrc: ["'self'", "'unsafe-inline'"],
+            styleSrc: ["'self'", "'unsafe-inline'", "https:"],
             scriptSrc: ["'self'", "'unsafe-inline'"],
             imgSrc: ["'self'", "data:", "https:"],
         }
     }
 }));
 
-// CORS - HTTPS first
+// CORS - Updated for Vercel
 app.use(cors({
-    origin: ['https://localhost:3000', 'http://localhost:3000'], // HTTPS FIRST
+    origin: [
+        'https://your-app-name.vercel.app', // Your Vercel domain
+        'http://localhost:3000', // Local development
+        process.env.FRONTEND_URL // Environment variable
+    ].filter(Boolean),
     credentials: true
 }));
 
-// Rate Limiting
+// Rate Limiting - Adjusted for serverless
 const generalLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 100,
+    max: 200, // Increased for serverless
     message: {
         success: false,
         error: 'Too many requests from this IP, please try again after 15 minutes'
@@ -48,7 +49,7 @@ const generalLimiter = rateLimit({
     legacyHeaders: false,
 });
 
-// Specific login rate limiter - COUNT ALL ATTEMPTS (failed and successful)
+// Specific login rate limiter
 const loginLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 5,
@@ -56,14 +57,14 @@ const loginLimiter = rateLimit({
         success: false,
         error: 'Too many login attempts from this IP, please try again after 15 minutes'
     },
-    skipSuccessfulRequests: false, // ← COUNT FAILED ATTEMPTS TOO
+    skipSuccessfulRequests: false,
     standardHeaders: true,
     legacyHeaders: false,
 });
 
 const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 50,
+    max: 100, // Increased
     message: {
         success: false,
         error: 'Too many auth requests from this IP, please try again after 15 minutes'
@@ -82,7 +83,7 @@ const recipeCreationLimiter = rateLimit({
 
 const adminLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 50,
+    max: 100, // Increased
     message: {
         success: false,
         error: 'Too many admin requests, please try again later'
@@ -90,7 +91,7 @@ const adminLimiter = rateLimit({
 });
 
 app.use('/api/', generalLimiter);
-app.use('/api/auth/login', loginLimiter); // ← SPECIFIC LOGIN LIMITER
+app.use('/api/auth/login', loginLimiter);
 app.use('/api/auth/', authLimiter);
 app.use('/api/recipes/create', recipeCreationLimiter);
 app.use('/api/admin/', adminLimiter);
@@ -102,29 +103,28 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 // Cookie parser
 app.use(cookieParser());
 
-// Data sanitization against NoSQL injection
+// Data sanitization
 app.use(mongoSanitize());
-
-// Data sanitization against XSS
 app.use(xss());
-
-// Prevent parameter pollution
 app.use(hpp());
 
-// Session configuration - CRITICAL FIX: Set secure to true for HTTPS
+// Session configuration - UPDATED FOR VERCEL
 app.use(session({
     secret: process.env.SESSION_SECRET || 'your-secret-key',
     resave: false,
     saveUninitialized: false,
     store: MongoStore.create({
         mongoUrl: process.env.MONGODB_URI,
-        touchAfter: 24 * 3600
+        touchAfter: 24 * 3600,
+        // Serverless optimizations
+        autoRemove: 'interval',
+        autoRemoveInterval: 10
     }),
     cookie: {
-        secure: true, // ← CHANGED FROM false TO true (THIS FIXES "NOT SECURE")
+        secure: process.env.NODE_ENV === 'production', // Auto-detect in Vercel
         httpOnly: true,
         maxAge: 7 * 24 * 60 * 60 * 1000,
-        sameSite: 'strict'
+        sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'strict' // Important for Vercel
     }
 }));
 
@@ -148,7 +148,12 @@ app.use('/api/recipes', recipeRoutes);
 
 // Health check
 app.get('/health', (req, res) => {
-    res.status(200).json({ status: 'OK', timestamp: new Date() });
+    res.status(200).json({ 
+        status: 'OK', 
+        timestamp: new Date(),
+        environment: process.env.NODE_ENV,
+        vercel: true
+    });
 });
 
 // 404 Handler
@@ -171,86 +176,36 @@ app.use((err, req, res, next) => {
     res.status(statusCode).json({
         success: false,
         message,
-        ...(process.env.NODE_ENV === 'development' && { stack: err.stack })
+        ...(process.env.NODE_ENV !== 'production' && { stack: err.stack })
     });
 });
 
-// MongoDB Connection
-mongoose.connect(process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/recipebox')
-    .then(() => {
-        logger.info('MongoDB connected successfully');
-        console.log('MongoDB connected');
-    })
-    .catch((error) => {
+// MongoDB Connection - UPDATED FOR VERCEL
+const connectDB = async () => {
+    try {
+        if (mongoose.connection.readyState === 0) {
+            await mongoose.connect(process.env.MONGODB_URI, {
+                // Serverless optimizations
+                maxPoolSize: 10,
+                minPoolSize: 1,
+                socketTimeoutMS: 30000,
+                serverSelectionTimeoutMS: 30000,
+            });
+            logger.info('MongoDB connected successfully to Vercel');
+            console.log('MongoDB connected to Vercel');
+        }
+    } catch (error) {
         logger.error('MongoDB connection error', { error: error.message });
         console.error('MongoDB connection failed:', error.message);
-        process.exit(1);
-    });
+        // Don't exit process in serverless
+    }
+};
 
-// HTTPS/HTTP Server Setup
-const PORT = process.env.PORT || 3000;
-let server;
-
-// Check if SSL certificates exist in ssl folder
-const keyPath = './ssl/key.pem';
-const certPath = './ssl/cert.pem';
-
-if (fs.existsSync(keyPath) && fs.existsSync(certPath)) {
-    const options = {
-        key: fs.readFileSync(keyPath),
-        cert: fs.readFileSync(certPath)
-    };
-    server = https.createServer(options, app).listen(PORT, () => {
-        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-        console.log(`Recipe Box Server Running (HTTPS - TRUSTED)`);
-        console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
-        console.log(`Port: ${PORT}`);
-        console.log(`Secure: https://localhost:${PORT}`);
-        console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
-        console.log(`Rate Limiting: ENABLED`);
-        console.log(`SSL: ENABLED (mkcert trusted)`);
-        console.log(`Secure Cookies: ENABLED`);
-        console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
-        console.log(`Admin: https://localhost:${PORT}/admin-login.html`);
-        console.log(`Users: https://localhost:${PORT}/login.html`);
-        console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
-        logger.info('HTTPS Server started successfully', { port: PORT });
-    });
-    console.log('HTTPS enabled with mkcert trusted certificates');
-} else {
-    server = http.createServer(app).listen(PORT, () => {
-        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-        console.log(`Recipe Box Server Running (HTTP)`);
-        console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
-        console.log(`Port: ${PORT}`);
-        console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
-        console.log(`Rate Limiting: ENABLED`);
-        console.log(`SSL:DISABLED (certificates not found)`);
-        console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
-        console.log(`Admin: http://localhost:${PORT}/admin-login.html`);
-        console.log(`Users: http://localhost:${PORT}/login.html`);
-        console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
-        logger.info('HTTP Server started successfully', { port: PORT });
-    });
-    console.log('Running in HTTP mode - SSL certificates not found in ssl folder');
-}
-
-// Graceful shutdown
-process.on('SIGTERM', () => {
-    logger.info('SIGTERM signal received: closing HTTP server');
-    server.close(() => {
-        logger.info('HTTP server closed');
-        mongoose.connection.close(false, () => {
-            logger.info('MongoDB connection closed');
-            process.exit(0);
-        });
-    });
+// Connect to DB on first request
+app.use(async (req, res, next) => {
+    await connectDB();
+    next();
 });
 
-process.on('unhandledRejection', (err) => {
-    logger.error('Unhandled Rejection', { error: err });
-    console.error('Unhandled Rejection:', err);
-    server.close(() => process.exit(1));
-});
-
+// Vercel requires module.exports = app
 module.exports = app;
