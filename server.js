@@ -137,6 +137,69 @@ app.use((req, res, next) => {
     next();
 });
 
+// MongoDB Connection - IMPROVED FOR VERCEL
+const connectDB = async () => {
+    try {
+        if (mongoose.connection.readyState === 0) {
+            // Close any existing connections first
+            await mongoose.disconnect();
+            
+            await mongoose.connect(process.env.MONGODB_URI, {
+                // Aggressive timeouts for serverless
+                maxPoolSize: 5,
+                minPoolSize: 1,
+                socketTimeoutMS: 10000,
+                connectTimeoutMS: 10000,
+                serverSelectionTimeoutMS: 10000,
+                maxIdleTimeMS: 20000,
+                waitQueueTimeoutMS: 10000,
+                bufferCommands: false, // Disable buffering
+                bufferMaxEntries: 0
+            });
+            console.log('✅ MongoDB connected to Vercel');
+        }
+    } catch (error) {
+        console.error('❌ MongoDB connection failed:', error.message);
+        // Don't throw error, just log it
+    }
+};
+
+// Enhanced connection middleware with caching
+let connectionPromise = null;
+let isConnecting = false;
+
+const ensureDatabaseConnection = async (req, res, next) => {
+    try {
+        // If already connected, proceed
+        if (mongoose.connection.readyState === 1) {
+            return next();
+        }
+
+        // If connecting in progress, wait for it
+        if (isConnecting && connectionPromise) {
+            await connectionPromise;
+            return next();
+        }
+
+        // Start new connection
+        isConnecting = true;
+        connectionPromise = connectDB();
+        await connectionPromise;
+        isConnecting = false;
+        
+        next();
+    } catch (error) {
+        console.error('Database connection middleware error:', error);
+        isConnecting = false;
+        
+        // Continue anyway - some routes might work without DB
+        next();
+    }
+};
+
+// Apply database connection middleware to API routes
+app.use('/api/', ensureDatabaseConnection);
+
 // Routes
 const authRoutes = require('./routes/authRoutes');
 const adminRoutes = require('./routes/adminRoutes');
@@ -146,13 +209,26 @@ app.use('/api/auth', authRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/recipes', recipeRoutes);
 
-// Health check
-app.get('/health', (req, res) => {
+// Health check with DB status
+app.get('/health', async (req, res) => {
+    const dbStatus = mongoose.connection.readyState === 1 ? 'connected' : 'disconnected';
+    
     res.status(200).json({ 
         status: 'OK', 
         timestamp: new Date(),
         environment: process.env.NODE_ENV,
-        vercel: true
+        vercel: true,
+        database: dbStatus,
+        mongooseState: mongoose.connection.readyState
+    });
+});
+
+// Simple test route without DB dependency
+app.get('/api/test', (req, res) => {
+    res.json({ 
+        message: 'Server is running!',
+        timestamp: new Date(),
+        environment: process.env.NODE_ENV
     });
 });
 
@@ -178,33 +254,6 @@ app.use((err, req, res, next) => {
         message,
         ...(process.env.NODE_ENV !== 'production' && { stack: err.stack })
     });
-});
-
-// MongoDB Connection - UPDATED FOR VERCEL
-const connectDB = async () => {
-    try {
-        if (mongoose.connection.readyState === 0) {
-            await mongoose.connect(process.env.MONGODB_URI, {
-                // Serverless optimizations
-                maxPoolSize: 10,
-                minPoolSize: 1,
-                socketTimeoutMS: 30000,
-                serverSelectionTimeoutMS: 30000,
-            });
-            logger.info('MongoDB connected successfully to Vercel');
-            console.log('MongoDB connected to Vercel');
-        }
-    } catch (error) {
-        logger.error('MongoDB connection error', { error: error.message });
-        console.error('MongoDB connection failed:', error.message);
-        // Don't exit process in serverless
-    }
-};
-
-// Connect to DB on first request
-app.use(async (req, res, next) => {
-    await connectDB();
-    next();
 });
 
 // Vercel requires module.exports = app
